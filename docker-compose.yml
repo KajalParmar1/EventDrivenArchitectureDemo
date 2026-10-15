@@ -1,0 +1,194 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: eda-postgres
+    environment:
+      POSTGRES_USER: eda
+      POSTGRES_PASSWORD: eda
+      POSTGRES_DB: orders
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infrastructure/docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eda -d orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: eda-kafka
+    hostname: kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: eda-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic order-events --partitions 3 --replication-factor 1 && kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic payment-events --partitions 3 --replication-factor 1 && kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic inventory-events --partitions 3 --replication-factor 1 && kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic notification-events --partitions 3 --replication-factor 1 && kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic order-events.dlq --partitions 1 --replication-factor 1 && kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic payment-events.dlq --partitions 1 --replication-factor 1 && kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic inventory-events.dlq --partitions 1 --replication-factor 1 && kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic notification-events.dlq --partitions 1 --replication-factor 1 && kafka-topics --bootstrap-server kafka:29092 --list"
+
+  order-service:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/OrderService.Dockerfile
+    container_name: eda-order-service
+    restart: unless-stopped
+    ports:
+      - "5080:8080"
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__Default: Host=postgres;Port=5432;Database=orders;Username=eda;Password=eda
+      Kafka__BootstrapServers: kafka:29092
+      Kafka__RetryCount: "3"
+      Kafka__RetryDelaySeconds: "2"
+      Kafka__Topics__OrderEvents: order-events
+      Kafka__Topics__PaymentEvents: payment-events
+      Kafka__Topics__InventoryEvents: inventory-events
+      Kafka__Topics__NotificationEvents: notification-events
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/PaymentService.Dockerfile
+    container_name: eda-payment-service
+    restart: unless-stopped
+    ports:
+      - "5081:8080"
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__Default: Host=postgres;Port=5432;Database=payments;Username=eda;Password=eda
+      Kafka__BootstrapServers: kafka:29092
+      Kafka__RetryCount: "3"
+      Kafka__RetryDelaySeconds: "2"
+      Kafka__ConsumerGroup: payment-service
+      Kafka__Topics__OrderEvents: order-events
+      Kafka__Topics__PaymentEvents: payment-events
+      Payment__FailForOrdersAbove: "10000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  inventory-service:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/InventoryService.Dockerfile
+    container_name: eda-inventory-service
+    restart: unless-stopped
+    ports:
+      - "5082:8080"
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__Default: Host=postgres;Port=5432;Database=inventory;Username=eda;Password=eda
+      Kafka__BootstrapServers: kafka:29092
+      Kafka__RetryCount: "3"
+      Kafka__RetryDelaySeconds: "2"
+      Kafka__ConsumerGroup: inventory-service
+      Kafka__Topics__OrderEvents: order-events
+      Kafka__Topics__InventoryEvents: inventory-events
+      Inventory__FailWhenTotalQuantityExceeds: "1000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/NotificationService.Dockerfile
+    container_name: eda-notification-service
+    restart: unless-stopped
+    ports:
+      - "5083:8080"
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__Default: Host=postgres;Port=5432;Database=notifications;Username=eda;Password=eda
+      Kafka__BootstrapServers: kafka:29092
+      Kafka__RetryCount: "3"
+      Kafka__RetryDelaySeconds: "2"
+      Kafka__ConsumerGroup: notification-service
+      Kafka__Topics__OrderEvents: order-events
+      Kafka__Topics__PaymentEvents: payment-events
+      Kafka__Topics__InventoryEvents: inventory-events
+      Kafka__Topics__NotificationEvents: notification-events
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+volumes:
+  postgres-data:

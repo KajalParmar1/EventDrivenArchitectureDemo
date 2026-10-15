@@ -1,0 +1,17 @@
+# Git
+.git
+.gitignore
+
+# Build
+**/bin
+**/obj
+**/.vs
+**/.idea
+**/TestResults
+
+# User
+*.user
+*.suo
+
+# Docs (not needed in image)
+README.md
